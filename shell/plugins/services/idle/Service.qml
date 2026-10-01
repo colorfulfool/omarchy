@@ -276,12 +276,6 @@ Item {
     else Qt.callLater(root.handleIdleChanged)
   }
 
-  onStayAwakeModeChanged: {
-    // The state file is the cross-process contract; the CLI writes it
-    // directly, so re-read rather than trusting the requested mode.
-    refreshStayAwakeState()
-  }
-
   IdleMonitor {
     id: idleMonitor
     enabled: root.idleEnabled

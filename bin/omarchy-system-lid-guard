@@ -138,18 +138,13 @@ reconcile() {
   fi
 
   if [[ -n $hold ]]; then
-    # A blocked lid close never reaches logind's suspend path, so lock here
-    # the way omarchy-system-lid-close would have around a real suspend.
-    # Skip it when docked: that is clamshell mode, still in use on the
-    # external display, and omarchy-system-lid-close deliberately leaves it
-    # unlocked.
-    if [[ $previous == "open" && $current == "closed" ]]; then
-      if ! omarchy-hw-external-monitors >/dev/null 2>&1; then
-        omarchy-system-lock >/dev/null 2>&1 || true
-      fi
-    fi
     # Never restart a live inhibitor: a kill-then-start gap lets logind act
     # on a closed lid between the two.
+    #
+    # No locking here: the Hyprland lid-switch binding still fires while the
+    # inhibitor holds, so omarchy-system-lid-close locks the close itself. A
+    # second lock would only repeat its layout, 1Password, and screensaver
+    # side effects.
     if ! inhibitor_alive; then
       start_inhibitor "$INHIBIT_WHY"
     fi

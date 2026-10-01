@@ -73,16 +73,23 @@ cat >"$mock_bin/systemctl" <<'SH'
 #!/bin/bash
 echo "systemctl $*" >>"$CALL_LOG"
 [[ $2 == "kill" ]] && exit "${MOCK_KILL_RC:-0}"
+[[ $2 == "start" ]] && exit "${MOCK_START_RC:-0}"
 [[ $2 == "is-active" ]] && exit "${MOCK_ACTIVE_RC:-0}"
 exit 0
 SH
 
-for command in omarchy-notification-send omarchy-system-lock; do
+for command in omarchy-notification-send omarchy-system-lock omarchy-hyprland-monitor-clamshell; do
   cat >"$mock_bin/$command" <<SH
 #!/bin/bash
 echo $command "\$*" >>"\$CALL_LOG"
 SH
 done
+
+cat >"$mock_bin/omarchy-hw-laptop-closed" <<'SH'
+#!/bin/bash
+# Lid closed when MOCK_LID_CLOSED=1, open otherwise.
+[[ ${MOCK_LID_CLOSED:-0} == 1 ]]
+SH
 
 cat >"$mock_bin/omarchy-power-present" <<'SH'
 #!/bin/bash
@@ -119,16 +126,25 @@ inhibitor_pid() {
   head -n 1 "$XDG_RUNTIME_DIR/omarchy-lid-guard/inhibit.pid" | cut -d' ' -f1
 }
 
-# Manual skip arms the flag, wakes the guard, and notifies.
+# Manual skip arms the flag, wakes the guard, and confirms the protection.
 : >"$call_log"
 "$toggle" skip-once
 [[ -f $HOME/.local/state/omarchy/toggles/lid-suspend-skip-once ]] ||
   fail "skip-once arms the flag" "flag missing"
 grep -q "systemctl --user kill -s USR1 --kill-whom=main omarchy-lid-guard.service" "$call_log" ||
   fail "skip-once wakes the guard" "$(cat "$call_log")"
-grep -q "omarchy-notification-send" "$call_log" ||
-  fail "skip-once notifies" "$(cat "$call_log")"
+grep -q "Lid suspend skipped" "$call_log" ||
+  fail "skip-once confirms the skip" "$(cat "$call_log")"
 pass "skip-once arms the flag, wakes the guard, and notifies"
+
+# A skip with no guard behind it says so instead of confirming protection.
+export MOCK_KILL_RC=1 MOCK_START_RC=1
+: >"$call_log"
+"$toggle" skip-once >/dev/null
+grep -q "Lid guard unavailable" "$call_log" ||
+  fail "skip-once reports a missing guard" "$(cat "$call_log")"
+export MOCK_KILL_RC=0 MOCK_START_RC=0
+pass "skip-once reports a missing guard"
 
 # Toggle flips the armed skip back off.
 "$toggle" toggle
@@ -239,17 +255,32 @@ echo "state:      open" >"$tmpdir/lid/state"
   fail "lid reopen consumes the skip" "flag still present"
 pass "lid reopen consumes the skip"
 
-# Closing the lid while guarded locks the session.
+# The guard never locks: the Hyprland lid-switch binding runs
+# omarchy-system-lid-close on every close, which locks itself.
 date -u +%s >"$HOME/.local/state/omarchy/toggles/lid-suspend-skip-once"
 echo "open" >"$XDG_RUNTIME_DIR/omarchy-lid-guard/prev-lid"
 echo "state:      closed" >"$tmpdir/lid/state"
 : >"$call_log"
 "$guard" reconcile
-grep -q "^omarchy-system-lock" "$call_log" ||
-  fail "guarded lid close locks" "$(cat "$call_log")"
+grep -q "^omarchy-system-lock" "$call_log" &&
+  fail "guard leaves locking to the lid-close binding" "$(cat "$call_log")"
+pass "guard leaves locking to the lid-close binding"
+
+# A close that reopens between two polls still consumes the skip: the
+# lid-close binding records the close synchronously for the guard.
+date -u +%s >"$HOME/.local/state/omarchy/toggles/lid-suspend-skip-once"
+echo "open" >"$XDG_RUNTIME_DIR/omarchy-lid-guard/prev-lid"
+echo "state:      closed" >"$tmpdir/lid/state"
+export MOCK_LID_CLOSED=1
+"$ROOT/bin/omarchy-system-lid-close"
+[[ $(cat "$XDG_RUNTIME_DIR/omarchy-lid-guard/prev-lid") == "closed" ]] ||
+  fail "lid close is recorded for the guard" "$(cat "$XDG_RUNTIME_DIR/omarchy-lid-guard/prev-lid" 2>/dev/null)"
+export MOCK_LID_CLOSED=0
 echo "state:      open" >"$tmpdir/lid/state"
 "$guard" reconcile
-pass "guarded lid close locks"
+[[ ! -f $HOME/.local/state/omarchy/toggles/lid-suspend-skip-once ]] ||
+  fail "a close between polls consumes the skip" "flag still present"
+pass "a close between polls consumes the skip"
 
 # The agent guard engages on AC only: never on battery.
 export MOCK_HERDR_STATE=working MOCK_AC=0
@@ -288,19 +319,6 @@ kill -0 "$first_pid" 2>/dev/null ||
   fail "the held inhibitor survives a change in which agents are working" "inhibitor $first_pid was replaced"
 pass "the held inhibitor survives a change in which agents are working"
 export MOCK_HERDR_STATE=idle
-"$guard" reconcile
-
-# A docked (clamshell) close never locks from the guard.
-export MOCK_DOCKED=1 MOCK_HERDR_STATE=working
-echo "open" >"$XDG_RUNTIME_DIR/omarchy-lid-guard/prev-lid"
-echo "state:      closed" >"$tmpdir/lid/state"
-: >"$call_log"
-"$guard" reconcile
-grep -q "^omarchy-system-lock" "$call_log" &&
-  fail "guarded docked lid close does not lock" "$(cat "$call_log")"
-pass "guarded docked lid close does not lock"
-export MOCK_DOCKED=0 MOCK_HERDR_STATE=idle
-echo "state:      open" >"$tmpdir/lid/state"
 "$guard" reconcile
 
 # Status reports flag and inhibitor state.

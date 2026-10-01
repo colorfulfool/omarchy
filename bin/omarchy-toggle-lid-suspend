@@ -21,7 +21,9 @@ flag_set() {
 poke_guard() {
   # The guard daemon owns the inhibitor; wake it so the flag takes effect
   # immediately instead of on its next poll. If it is not running, start it.
-  systemctl --user kill -s USR1 "$SERVICE" 2>/dev/null ||
+  # Signal only the main process: the default --kill-whom=all would also hit
+  # the held systemd-inhibit child.
+  systemctl --user kill -s USR1 --kill-whom=main "$SERVICE" 2>/dev/null ||
     systemctl --user start "$SERVICE" 2>/dev/null ||
     echo "lid-guard service is not available; the skip is recorded but nothing is watching" >&2
 }

@@ -24,6 +24,10 @@ PIDFILE="$RUNTIME_DIR/inhibit.pid"
 PREV_LID="$RUNTIME_DIR/prev-lid"
 INTERVAL=5
 SKIP_TTL=1800
+# Fixed inhibitor reason: the working set of agents changes while the lid is
+# held, and restarting the inhibitor for new --why text opens a gap where a
+# closed lid can suspend. Keep one live inhibitor while any reason applies.
+INHIBIT_WHY="lid suspend guard (manual skip or working agents on AC)"
 
 process_start_time() {
   local process_pid="$1"
@@ -90,10 +94,6 @@ inhibitor_alive() {
   [[ $current_start == "$recorded_start" ]]
 }
 
-recorded_reason() {
-  sed -n 2p "$PIDFILE" 2>/dev/null
-}
-
 start_inhibitor() {
   local reason="$1"
   local inhibit_pid=""
@@ -119,7 +119,7 @@ reconcile() {
   local previous=""
   local current=""
   local names=""
-  local reason=""
+  local hold=""
 
   mkdir -p "$RUNTIME_DIR"
   previous=$(cat "$PREV_LID" 2>/dev/null || lid_state || echo unknown)
@@ -132,24 +132,26 @@ reconcile() {
   fi
 
   if flag_set; then
-    reason="manual skip of next lid suspend"
+    hold=1
   elif names=$(working_agent_names) && omarchy-power-present >/dev/null 2>&1; then
-    reason="agents working on AC: $names"
+    hold=1
   fi
 
-  if [[ -n $reason ]]; then
+  if [[ -n $hold ]]; then
     # A blocked lid close never reaches logind's suspend path, so lock here
     # the way omarchy-system-lid-close would have around a real suspend.
+    # Skip it when docked: that is clamshell mode, still in use on the
+    # external display, and omarchy-system-lid-close deliberately leaves it
+    # unlocked.
     if [[ $previous == "open" && $current == "closed" ]]; then
-      omarchy-system-lock >/dev/null 2>&1 || true
-    fi
-    if inhibitor_alive; then
-      if [[ $(recorded_reason) != "$reason" ]]; then
-        stop_inhibitor
-        start_inhibitor "$reason"
+      if ! omarchy-hw-external-monitors >/dev/null 2>&1; then
+        omarchy-system-lock >/dev/null 2>&1 || true
       fi
-    else
-      start_inhibitor "$reason"
+    fi
+    # Never restart a live inhibitor: a kill-then-start gap lets logind act
+    # on a closed lid between the two.
+    if ! inhibitor_alive; then
+      start_inhibitor "$INHIBIT_WHY"
     fi
   else
     stop_inhibitor
@@ -158,10 +160,11 @@ reconcile() {
 
 cmd_daemon() {
   trap reconcile USR1
-  trap stop_inhibitor TERM INT EXIT
+  trap 'exit 0' TERM INT
+  trap stop_inhibitor EXIT
   while true; do
     reconcile
-    sleep "$INTERVAL" || true
+    sleep "$INTERVAL" & wait $! || true
   done
 }
 

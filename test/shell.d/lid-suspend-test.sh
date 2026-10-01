@@ -49,6 +49,9 @@ case "${MOCK_HERDR_STATE:-idle}" in
   working)
     echo '{"result":{"agents":[{"agent":"opencode","agent_status":"working"},{"agent":"claude","agent_status":"idle"}]}}'
     ;;
+  working2)
+    echo '{"result":{"agents":[{"agent":"opencode","agent_status":"done"},{"agent":"claude","agent_status":"working"}]}}'
+    ;;
   idle)
     echo '{"result":{"agents":[{"agent":"opencode","agent_status":"idle"}]}}'
     ;;
@@ -85,11 +88,31 @@ cat >"$mock_bin/omarchy-power-present" <<'SH'
 #!/bin/bash
 [[ ${MOCK_AC:-1} == 1 ]]
 SH
+
+cat >"$mock_bin/omarchy-hw-external-monitors" <<'SH'
+#!/bin/bash
+# Docked (external monitor connected) when MOCK_DOCKED=1, otherwise undocked.
+[[ ${MOCK_DOCKED:-0} == 1 ]]
+SH
 chmod +x "$mock_bin"/*
 export PATH="$mock_bin:$PATH"
 
 inhibit_spawns() {
   grep -c "^systemd-inhibit --what=handle-lid-switch.*--mode=block" "$call_log"
+}
+
+# The mock systemd-inhibit logs from a background child, so its line can land
+# just after reconcile returns. Poll briefly rather than asserting immediately.
+wait_for_spawns() {
+  local expected="$1"
+  local _i
+  for _i in {1..50}; do
+    if (( $(inhibit_spawns) == expected )); then
+      return 0
+    fi
+    sleep 0.05
+  done
+  return 1
 }
 
 inhibitor_pid() {
@@ -101,7 +124,7 @@ inhibitor_pid() {
 "$toggle" skip-once
 [[ -f $HOME/.local/state/omarchy/toggles/lid-suspend-skip-once ]] ||
   fail "skip-once arms the flag" "flag missing"
-grep -q "systemctl --user kill -s USR1 omarchy-lid-guard.service" "$call_log" ||
+grep -q "systemctl --user kill -s USR1 --kill-whom=main omarchy-lid-guard.service" "$call_log" ||
   fail "skip-once wakes the guard" "$(cat "$call_log")"
 grep -q "omarchy-notification-send" "$call_log" ||
   fail "skip-once notifies" "$(cat "$call_log")"
@@ -129,19 +152,24 @@ pass "allow clears the flag"
 export MOCK_HERDR_STATE=working
 : >"$call_log"
 "$guard" reconcile
-(( $(inhibit_spawns) == 1 )) ||
+wait_for_spawns 1 ||
   fail "working agent starts one inhibitor" "$(cat "$call_log")"
 first_pid=$(inhibitor_pid)
 kill -0 "$first_pid" 2>/dev/null ||
   fail "inhibitor process is alive" "pid $first_pid"
 "$guard" reconcile
-(( $(inhibit_spawns) == 1 )) ||
+wait_for_spawns 1 ||
   fail "reconcile reuses a live inhibitor" "$(cat "$call_log")"
 pass "working agent holds one lid inhibitor"
 
 # Idle agents release it.
 export MOCK_HERDR_STATE=idle
 "$guard" reconcile
+# SIGTERM delivery is asynchronous; poll briefly before declaring it alive.
+for _ in {1..50}; do
+  kill -0 "$first_pid" 2>/dev/null || break
+  sleep 0.05
+done
 kill -0 "$first_pid" 2>/dev/null &&
   fail "idle agents release the inhibitor" "pid $first_pid still alive"
 [[ ! -f $XDG_RUNTIME_DIR/omarchy-lid-guard/inhibit.pid ]] ||
@@ -165,7 +193,7 @@ export MOCK_HERDR_STATE=idle
 : >"$call_log"
 "$toggle" skip-once >/dev/null
 "$guard" reconcile
-(( $(inhibit_spawns) == 1 )) ||
+wait_for_spawns 1 ||
   fail "manual skip inhibits with idle agents" "$(cat "$call_log")"
 guard_pid=$(inhibitor_pid)
 "$toggle" allow >/dev/null
@@ -180,7 +208,7 @@ kill "$guard_pid" 2>/dev/null || true
 "$guard" reconcile
 kill -0 "$innocent_pid" 2>/dev/null ||
   fail "stale pidfile does not kill unrelated processes" "innocent pid $innocent_pid died"
-(( $(inhibit_spawns) == 1 )) ||
+wait_for_spawns 1 ||
   fail "stale pidfile is replaced" "$(cat "$call_log")"
 [[ $(inhibitor_pid) != "$innocent_pid" ]] ||
   fail "stale pidfile is replaced" "pidfile still points at $innocent_pid"
@@ -233,13 +261,47 @@ pass "battery suspends despite working agents"
 export MOCK_AC=1
 : >"$call_log"
 "$guard" reconcile
-(( $(inhibit_spawns) == 1 )) ||
+wait_for_spawns 1 ||
   fail "AC inhibits for working agents" "$(cat "$call_log")"
-grep -q "agents working on AC" "$call_log" ||
-  fail "inhibitor reason names AC" "$(cat "$call_log")"
+grep -q "lid suspend guard" "$call_log" ||
+  fail "inhibitor reason is stable" "$(cat "$call_log")"
 export MOCK_HERDR_STATE=idle
 "$guard" reconcile
 pass "AC inhibits for working agents"
+
+# A change in which agents are working keeps the same live inhibitor.
+export MOCK_HERDR_STATE=working
+: >"$call_log"
+"$guard" reconcile
+first_pid=$(inhibitor_pid)
+kill -0 "$first_pid" 2>/dev/null ||
+  fail "working agents hold the lid" "pid $first_pid"
+export MOCK_HERDR_STATE=working2
+: >"$call_log"
+"$guard" reconcile
+# A buggy kill-and-restart would log its replacement within milliseconds; give
+# it time to act before asserting nothing spawned.
+sleep 0.3
+(( $(inhibit_spawns) == 0 )) ||
+  fail "a changed working set keeps the live inhibitor" "$(cat "$call_log")"
+kill -0 "$first_pid" 2>/dev/null ||
+  fail "the held inhibitor survives a change in which agents are working" "inhibitor $first_pid was replaced"
+pass "the held inhibitor survives a change in which agents are working"
+export MOCK_HERDR_STATE=idle
+"$guard" reconcile
+
+# A docked (clamshell) close never locks from the guard.
+export MOCK_DOCKED=1 MOCK_HERDR_STATE=working
+echo "open" >"$XDG_RUNTIME_DIR/omarchy-lid-guard/prev-lid"
+echo "state:      closed" >"$tmpdir/lid/state"
+: >"$call_log"
+"$guard" reconcile
+grep -q "^omarchy-system-lock" "$call_log" &&
+  fail "guarded docked lid close does not lock" "$(cat "$call_log")"
+pass "guarded docked lid close does not lock"
+export MOCK_DOCKED=0 MOCK_HERDR_STATE=idle
+echo "state:      open" >"$tmpdir/lid/state"
+"$guard" reconcile
 
 # Status reports flag and inhibitor state.
 status_out=$("$toggle" status)

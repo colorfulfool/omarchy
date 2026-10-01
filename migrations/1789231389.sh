@@ -2,8 +2,16 @@ echo "Keep lid-close awake while coding agents are working"
 
 systemctl --user daemon-reload >/dev/null 2>&1 || true
 
-# Report what systemctl actually said; "could not enable" on its own gives
-# nothing to act on.
-if ! error=$(systemctl --user enable --now omarchy-lid-guard.service 2>&1); then
-  echo "Could not enable omarchy-lid-guard.service: $error"
+# `systemctl enable` needs a live user manager, which an update from a TTY does
+# not have, so fall back to writing the symlink it would have written.
+if ! systemctl --user enable omarchy-lid-guard.service >/dev/null 2>&1; then
+  wants_dir="$HOME/.config/systemd/user/graphical-session.target.wants"
+  mkdir -p "$wants_dir"
+  ln -sfn /usr/lib/systemd/user/omarchy-lid-guard.service \
+    "$wants_dir/omarchy-lid-guard.service"
+fi
+
+# Nothing to start into over SSH; the next graphical login handles it.
+if systemctl --user is-active --quiet graphical-session.target; then
+  systemctl --user start omarchy-lid-guard.service >/dev/null 2>&1 || true
 fi

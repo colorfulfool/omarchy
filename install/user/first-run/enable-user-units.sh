@@ -19,7 +19,9 @@ systemctl --user enable --now \
   omarchy-sleep-lock.service \
   omarchy-migrate-notify.service \
   omarchy-fcitx5.service \
-  omarchy-crash-watch.service \
-  omarchy-lid-guard.service
+  omarchy-crash-watch.service
+
+# Enabled separately so a missing unit here never blocks the list above.
+systemctl --user enable --now omarchy-lid-guard.service
 
 omarchy-hook-install theme-set /usr/share/owe/10-owe-sync
